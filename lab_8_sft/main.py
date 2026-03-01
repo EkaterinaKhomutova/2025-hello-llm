@@ -6,6 +6,37 @@ Fine-tuning Large Language Models for a downstream task.
 
 # pylint: disable=too-few-public-methods, undefined-variable, duplicate-code, unused-argument, too-many-arguments
 from typing import Callable, Iterable, Sequence
+import logging
+from pathlib import Path
+from typing import Callable, Iterable, Optional, Sequence, Union
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+from pandas import DataFrame
+from peft import LoraConfig, TaskType, get_peft_model
+from sklearn.metrics import accuracy_score, f1_score
+from torch.utils.data import DataLoader, Dataset
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    PreTrainedTokenizerBase,
+    Trainer,
+    TrainingArguments,
+)
+
+from core_utils.decorators import report_time
+from core_utils.llm.llm_pipeline import AbstractLLMPipeline
+from core_utils.llm.metrics import Metrics
+from core_utils.llm.raw_data_importer import AbstractRawDataImporter
+from core_utils.llm.raw_data_preprocessor import AbstractRawDataPreprocessor
+from core_utils.llm.sft_pipeline import AbstractSFTPipeline
+from core_utils.llm.task_evaluator import AbstractTaskEvaluator
+from core_utils.project.lab_settings import SFTParams
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class RawDataImporter(AbstractRawDataImporter):
@@ -18,6 +49,10 @@ class RawDataImporter(AbstractRawDataImporter):
         """
         Import dataset.
         """
+        self._raw_data = load_dataset(self._hf_name, split="test").to_pandas()
+
+        if not isinstance(self._raw_data, pd.DataFrame):
+            raise TypeError("Downloaded dataset is not pd.DataFrame")
 
 
 class RawDataPreprocessor(AbstractRawDataPreprocessor):
@@ -32,12 +67,34 @@ class RawDataPreprocessor(AbstractRawDataPreprocessor):
         Returns:
             dict: dataset key properties.
         """
+        f = self._data
+        source_empty = (df['source'].isna() | (df['source'].astype(str).str.strip() == '')).sum()
+        target_dist = df['target'].value_counts().sort_index().to_dict()
+
+        return {
+            'total_samples': len(df),
+            'duplicates': int(df.duplicated().sum()),
+            'empty_source': int(source_empty),
+            'target_distribution': target_dist,
+        }
 
     @report_time
     def transform(self) -> None:
         """
         Apply preprocessing transformations to the raw dataset.
         """
+        if self._raw_data is None:
+            raise ValueError("No raw data to preprocess. Run obtain() first.")
+
+        df = self._raw_data.copy()
+        df = df.rename(columns={'toxic': 'target', 'neutral': 'source'})
+        df = df[['source', 'target']].dropna()
+        df = df.drop_duplicates()
+        df['target'] = df['target'].astype(int)
+        df = df.reset_index(drop=True)
+
+        self._data = df
+        logger.info("Preprocessing completed. Final shape: %s", df.shape)
 
 
 class TaskDataset(Dataset):
@@ -52,6 +109,7 @@ class TaskDataset(Dataset):
         Args:
             data (pandas.DataFrame): Original data
         """
+        self._data = data
 
     def __len__(self) -> int:
         """
@@ -60,6 +118,7 @@ class TaskDataset(Dataset):
         Returns:
             int: The number of items in the dataset
         """
+        return len(self._data)
 
     def __getitem__(self, index: int) -> tuple[str, ...]:
         """
@@ -71,6 +130,8 @@ class TaskDataset(Dataset):
         Returns:
             tuple[str, ...]: The item to be received
         """
+        row = self._data.iloc[index]
+        return (str(row['source']), int(row['target']))
 
     @property
     def data(self) -> DataFrame:
@@ -80,6 +141,7 @@ class TaskDataset(Dataset):
         Returns:
             pandas.DataFrame: Preprocessed DataFrame
         """
+        return self._data
 
 
 def tokenize_sample(
@@ -97,6 +159,26 @@ def tokenize_sample(
     Returns:
         dict[str, torch.Tensor]: Tokenized sample
     """
+    text = str(sample['source'])
+    label = int(sample['target'])
+
+    encoding = tokenizer(
+        text,
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors='pt'
+    )
+
+    input_ids = encoding['input_ids'].squeeze(0)
+    attention_mask = encoding['attention_mask'].squeeze(0)
+    labels = torch.tensor(label, dtype=torch.long)
+
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels
+    }
 
 
 class TokenizedTaskDataset(Dataset):
